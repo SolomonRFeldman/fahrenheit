@@ -322,8 +322,8 @@ internal sealed class FhCallRegistry {
     private readonly static Dictionary<Delegate, nint>          _chain    = []; // Hook     -> Next function in chain
     private readonly static HashSet   <nint>                    _inval    = []; // Invalidated calls that need cleaning
 
-    private          int            _lock_commit = 0;
-    private readonly AutoResetEvent _lock_chains = new AutoResetEvent(true);
+    private          int  _lock_commit = 0;
+    private readonly Lock _lock_chains = new();
 
     /// <summary>
     ///     Invalidates all call information in a given module.
@@ -332,45 +332,43 @@ internal sealed class FhCallRegistry {
         nint module_base,
         uint module_size
     ) {
-        _lock_chains.WaitOne();
+        lock (_lock_chains) {
+            nint module_end = nint.CreateChecked( module_base + module_size );
 
-        nint module_end = nint.CreateChecked( module_base + module_size );
+            foreach ((nint call_addr, FhCallContext call_context) in _contexts) {
+                if (call_addr < module_base || call_addr > module_end)
+                    continue;
 
-        foreach ((nint call_addr, FhCallContext call_context) in _contexts) {
-            if (call_addr < module_base || call_addr > module_end)
-                continue;
-
-            bool first_in_stack = true;
-            foreach (FhHookContext stack_entry in call_context.stack) {
-                if (!_chain.Remove(stack_entry.fnptr, out nint fnptr) || !_fnptrs.Remove(fnptr)) {
-                    throw new Exception($"Failed to invalidate chain entry '{stack_entry.fnptr.Method.Name}'.");
-                }
-
-                if (!first_in_stack) {
-                    FhPInvoke.MH_STATUS rm_res = FhPInvoke.MH_RemoveHook(fnptr);
-                    if (rm_res != FhPInvoke.MH_STATUS.MH_OK) {
-                        throw new Exception($"Failed to unwind chain entry '{stack_entry.fnptr.Method.Name}' - {rm_res}.");
+                bool first_in_stack = true;
+                foreach (FhHookContext stack_entry in call_context.stack) {
+                    if (!_chain.Remove(stack_entry.fnptr, out nint fnptr) || !_fnptrs.Remove(fnptr)) {
+                        throw new Exception($"Failed to invalidate chain entry '{stack_entry.fnptr.Method.Name}'.");
                     }
+
+                    if (!first_in_stack) {
+                        FhPInvoke.MH_STATUS rm_res = FhPInvoke.MH_RemoveHook(fnptr);
+                        if (rm_res != FhPInvoke.MH_STATUS.MH_OK) {
+                            throw new Exception($"Failed to unwind chain entry '{stack_entry.fnptr.Method.Name}' - {rm_res}.");
+                        }
+                    }
+
+                    first_in_stack = false;
                 }
 
-                first_in_stack = false;
+                if (!_contexts.Remove(call_addr) || !_inval.Add(call_addr)) {
+                    throw new Exception($"Failed to invalidate call at 0x{call_addr:X8}.");
+                }
             }
 
-            if (!_contexts.Remove(call_addr) || !_inval.Add(call_addr)) {
-                throw new Exception($"Failed to invalidate call at 0x{call_addr:X8}.");
-            }
-        }
+            foreach ((nint fnptr_addr, _) in _fnptrs) {
+                if (fnptr_addr < module_base || fnptr_addr > module_end)
+                    continue;
 
-        foreach ((nint fnptr_addr, _) in _fnptrs) {
-            if (fnptr_addr < module_base || fnptr_addr > module_end)
-                continue;
-
-            if (!_fnptrs.Remove(fnptr_addr)) {
-                throw new Exception($"Failed to invalidate delegate at 0x{fnptr_addr:X8}.");
+                if (!_fnptrs.Remove(fnptr_addr)) {
+                    throw new Exception($"Failed to invalidate delegate at 0x{fnptr_addr:X8}.");
+                }
             }
         }
-
-        _lock_chains.Set();
     }
 
     /// <summary>
@@ -378,18 +376,15 @@ internal sealed class FhCallRegistry {
     /// </summary>
     /// <returns>A newly generated or cached delegate for the target function.</returns>
     public T get_fnptr<T>(nint ptr_target) where T : Delegate {
-        _lock_chains.WaitOne();
+        lock (_lock_chains) {
+            if (_fnptrs.TryGetValue(ptr_target, out Delegate? fnptr) && fnptr is T t_fnptr)
+                return t_fnptr;
 
-        if (_fnptrs.TryGetValue(ptr_target, out Delegate? fnptr) && fnptr is T t_fnptr) {
-            _lock_chains.Set();
+            t_fnptr = Marshal.GetDelegateForFunctionPointer<T>(ptr_target);
+            _fnptrs[ptr_target] = t_fnptr;
+
             return t_fnptr;
         }
-
-        t_fnptr = Marshal.GetDelegateForFunctionPointer<T>(ptr_target);
-        _fnptrs[ptr_target] = t_fnptr;
-
-        _lock_chains.Set();
-        return t_fnptr;
     }
 
     /// <summary>
@@ -497,27 +492,22 @@ internal sealed class FhCallRegistry {
 
     /// <inheritdoc cref="fnptr_chain_insert{T}(nint, T)" />
     public bool fnptr_chain_add<T>(nint ptr_target, FhHookContext hook) where T : Delegate {
-        _lock_chains.WaitOne();
+        lock (_lock_chains) {
+            if (_contexts.TryGetValue(ptr_target, out FhCallContext? target)) {
+                if (target.tainted) {
+                    FhInternal.Log.Error($"Late insertion rejected. (0x{ptr_target:X8}, {hook.fnptr.Method.Name})");
+                    return false;
+                }
 
-        if (_contexts.TryGetValue(ptr_target, out FhCallContext? target)) {
-            if (target.tainted) {
-                FhInternal.Log.Error($"Late insertion rejected. (0x{ptr_target:X8}, {hook.fnptr.Method.Name})");
-
-                _lock_chains.Set();
-                return false;
+                target.stack.Push(hook);
             }
+            else {
+                target = new(ptr_target);
+                target.stack.Push(hook);
 
-            target.stack.Push(hook);
-            _lock_chains.Set();
-
-            return _lock_commit == 0 || fnptr_chain_insert(ptr_target, hook.fnptr);
+                _contexts[ptr_target] = target;
+            }
         }
-
-        target = new(ptr_target);
-        target.stack.Push(hook);
-
-        _contexts[ptr_target] = target;
-        _lock_chains.Set();
 
         return _lock_commit == 0 || fnptr_chain_insert(ptr_target, hook.fnptr);
     }
@@ -529,22 +519,20 @@ internal sealed class FhCallRegistry {
         if (Interlocked.CompareExchange(ref _lock_commit, 1, 0) == 1)
             return true; // reject repeat calls
 
-        _lock_chains.WaitOne();
+        lock (_lock_chains) {
+            foreach ((nint ptr_target, FhCallContext target) in _contexts) {
+                Stack<FhHookContext> target_stack = target.stack;
 
-        foreach ((nint ptr_target, FhCallContext target) in _contexts) {
-            Stack<FhHookContext> target_stack = target.stack;
-
-            foreach (FhHookContext hook in target_stack) {
-                if (!fnptr_chain_insert(ptr_target, hook.fnptr)) {
-                    _lock_chains.Set();
-                    return false;
+                foreach (FhHookContext hook in target_stack) {
+                    if (!fnptr_chain_insert(ptr_target, hook.fnptr))
+                        return false;
                 }
-            }
 
-            target.tainted = true;
+                target.tainted = true;
+            }
         }
 
-        return _lock_chains.Set();
+        return true;
     }
 
 }
