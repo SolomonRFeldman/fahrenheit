@@ -322,8 +322,8 @@ internal sealed class FhCallRegistry {
     private readonly static Dictionary<Delegate, nint>          _chain    = []; // Hook     -> Next function in chain
     private readonly static HashSet   <nint>                    _inval    = []; // Invalidated calls that need cleaning
 
-    private          int  _lock_commit = 0;
-    private readonly Lock _lock_chains = new();
+    private          int                 _lock_commit = 0;
+    private readonly FhChainLockProfiler _lock_chains = new();
 
     /// <summary>
     ///     Invalidates all call information in a given module.
@@ -332,7 +332,8 @@ internal sealed class FhCallRegistry {
         nint module_base,
         uint module_size
     ) {
-        lock (_lock_chains) {
+        _lock_chains.enter();
+        try {
             nint module_end = nint.CreateChecked( module_base + module_size );
 
             foreach ((nint call_addr, FhCallContext call_context) in _contexts) {
@@ -369,6 +370,9 @@ internal sealed class FhCallRegistry {
                 }
             }
         }
+        finally {
+            _lock_chains.exit();
+        }
     }
 
     /// <summary>
@@ -376,7 +380,8 @@ internal sealed class FhCallRegistry {
     /// </summary>
     /// <returns>A newly generated or cached delegate for the target function.</returns>
     public T get_fnptr<T>(nint ptr_target) where T : Delegate {
-        lock (_lock_chains) {
+        _lock_chains.enter();
+        try {
             if (_fnptrs.TryGetValue(ptr_target, out Delegate? fnptr) && fnptr is T t_fnptr)
                 return t_fnptr;
 
@@ -384,6 +389,9 @@ internal sealed class FhCallRegistry {
             _fnptrs[ptr_target] = t_fnptr;
 
             return t_fnptr;
+        }
+        finally {
+            _lock_chains.exit();
         }
     }
 
@@ -492,7 +500,8 @@ internal sealed class FhCallRegistry {
 
     /// <inheritdoc cref="fnptr_chain_insert{T}(nint, T)" />
     public bool fnptr_chain_add<T>(nint ptr_target, FhHookContext hook) where T : Delegate {
-        lock (_lock_chains) {
+        _lock_chains.enter();
+        try {
             if (_contexts.TryGetValue(ptr_target, out FhCallContext? target)) {
                 if (target.tainted) {
                     FhInternal.Log.Error($"Late insertion rejected. (0x{ptr_target:X8}, {hook.fnptr.Method.Name})");
@@ -508,6 +517,9 @@ internal sealed class FhCallRegistry {
                 _contexts[ptr_target] = target;
             }
         }
+        finally {
+            _lock_chains.exit();
+        }
 
         return _lock_commit == 0 || fnptr_chain_insert(ptr_target, hook.fnptr);
     }
@@ -519,7 +531,8 @@ internal sealed class FhCallRegistry {
         if (Interlocked.CompareExchange(ref _lock_commit, 1, 0) == 1)
             return true; // reject repeat calls
 
-        lock (_lock_chains) {
+        _lock_chains.enter();
+        try {
             foreach ((nint ptr_target, FhCallContext target) in _contexts) {
                 Stack<FhHookContext> target_stack = target.stack;
 
@@ -530,6 +543,9 @@ internal sealed class FhCallRegistry {
 
                 target.tainted = true;
             }
+        }
+        finally {
+            _lock_chains.exit();
         }
 
         return true;
